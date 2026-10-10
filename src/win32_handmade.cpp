@@ -2,6 +2,10 @@
 #include <cstdint>
 #include <iostream>
 #include <xinput.h>
+#include <dsound.h>
+
+// apparently GDB does not capture windows debug outputs...wtf
+#define OutputDebugString printf
 
 // static is a horrible keyword in c/c++
 #define local_persist static
@@ -51,6 +55,12 @@ global_variable x_input_get_state *XInputGetState_ = XInputGetStateStub;
 #define XInputSetState XInputSetState_
 #define XInputGetState XInputGetState_
 
+
+// Note(mike): do the same thing we did for xinput with DirectSound
+#define DIRECT_SOUND_CREATE(name) HRESULT WINAPI name(LPCGUID lpGUID,LPDIRECTSOUND *ppDS,LPUNKNOWN pUnkOuter)
+
+typedef DIRECT_SOUND_CREATE(direct_sound_create);
+
 internal void
 Win32LoadXInput(void) {
     // NOTE(mike): we try to manually load the xinput functions we want to use
@@ -58,6 +68,70 @@ Win32LoadXInput(void) {
     if (xinput_lib) {
         XInputGetState = (x_input_get_state *) GetProcAddress(xinput_lib, "XInputGetState");
         XInputSetState = (x_input_set_state *) GetProcAddress(xinput_lib, "XInputSetState");
+    } else {
+        // TODO(mike): Diagnostic
+    }
+}
+
+internal void
+Win32InitDSound(HWND window, int32_t samples_per_second, int32_t buffer_size) {
+    // Note(mike): Load the library. We won't exit if the library is not available, the game will just be silent
+    HMODULE d_sound_lib = LoadLibrary("dsound.dll");
+    if (d_sound_lib) {
+        auto *DirectSoundCreate = (direct_sound_create *) GetProcAddress(d_sound_lib, "DirectSoundCreate");
+        // Note(mike): Get a DirectSound object (oh no, OOP)
+        LPDIRECTSOUND direct_sound;
+        if (DirectSoundCreate && SUCCEEDED(DirectSoundCreate(nullptr, &direct_sound, nullptr))) {
+            WAVEFORMATEX waveformatex = {};
+            waveformatex.wFormatTag = WAVE_FORMAT_PCM;
+            waveformatex.nChannels = 2; // for stereo
+            waveformatex.wBitsPerSample = 16; // CDs are 16Bits per sample
+            waveformatex.nSamplesPerSec = samples_per_second;
+            waveformatex.nBlockAlign = waveformatex.nChannels * waveformatex.wBitsPerSample / 8;
+            // how big one sound "unit" in the buffer is
+            waveformatex.nAvgBytesPerSec = waveformatex.nSamplesPerSec * waveformatex.nBlockAlign;
+            waveformatex.cbSize = 0; // no extensions
+
+            if (SUCCEEDED(direct_sound->SetCooperativeLevel(window,DSSCL_PRIORITY))) {
+                //// Note(mike): Create a primary buffer
+
+                DSBUFFERDESC buffer_description = {};
+                buffer_description.dwSize = sizeof(buffer_description);
+                // TODO(mike): the flags might needs some playing around with
+                buffer_description.dwFlags = DSBCAPS_PRIMARYBUFFER;
+
+                LPDIRECTSOUNDBUFFER primary_buffer;
+                if (SUCCEEDED(direct_sound->CreateSoundBuffer(&buffer_description, &primary_buffer, nullptr))) {
+                    if (SUCCEEDED(primary_buffer->SetFormat(&waveformatex))) {
+                        // NOTE(mike): we finally set the format of the primary buffer
+                        OutputDebugString("Primary buffer format was set.\n");
+                    } else {
+                        // TODO(mike): Diagnostic
+                    }
+                } else {
+                    // TODO(mike): Diagnostic
+                }
+            } else {
+                // TODO(mike): Diagnostic
+            }
+
+            // Note(mike): Create a secondary buffer, in which we will actually write
+            DSBUFFERDESC secondary_buffer_description = {};
+            secondary_buffer_description.dwSize = sizeof(secondary_buffer_description);
+            secondary_buffer_description.dwBufferBytes = buffer_size;
+            secondary_buffer_description.lpwfxFormat = &waveformatex;
+            secondary_buffer_description.dwFlags = 0;
+
+            LPDIRECTSOUNDBUFFER secondary_buffer;
+            if (SUCCEEDED(direct_sound->CreateSoundBuffer(&secondary_buffer_description, &secondary_buffer, nullptr))) {
+                OutputDebugString("Secondary Buffer Created.\n");
+            }
+        } else {
+            // TODO(mike): Diagnostic
+        }
+    } else {
+        // TODO(mike): Diagnostic
+        OutputDebugString("nope. no direct sound.");
     }
 }
 
@@ -242,11 +316,9 @@ Win32MainWindowCallback(
         }
         break;
         case WM_ACTIVATEAPP: {
-            OutputDebugString("WM_ACTIVATEAPP\n");
             break;
         }
         default: {
-            OutputDebugString("default\n");
             // tell windows this is a message we want to ignore
             result = DefWindowProc(window, message, wParam, lParam);
         }
@@ -292,6 +364,8 @@ WinMain(
 
             int x_offset = 0;
             int y_offset = 0;
+
+            Win32InitDSound(window_handle, 48000, 48000 * sizeof(int16_t) * 2);
 
             Running = true;
             while (Running) {
