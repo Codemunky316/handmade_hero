@@ -5,6 +5,7 @@
 #include <dsound.h>
 
 // apparently GDB does not capture windows debug outputs...wtf
+// not something i'd do in PROD
 #define OutputDebugString printf
 
 // static is a horrible keyword in c/c++
@@ -28,6 +29,11 @@ struct win32_window_dimensions {
     int width;
     int height;
 };
+
+// TODO these are global for now
+global_variable bool32 Running;
+global_variable win32_offscreen_buffer global_backbuffer;
+global_variable LPDIRECTSOUNDBUFFER secondary_buffer;
 
 // NOTE(mike): manually loading xinput functions to deal with potentially missing/incorrect library
 #define X_INPUT_GET_STATE(name) DWORD WINAPI name(DWORD dw_user_index, XINPUT_STATE *p_out_state)
@@ -122,7 +128,6 @@ Win32InitDSound(HWND window, int32_t samples_per_second, int32_t buffer_size) {
             secondary_buffer_description.lpwfxFormat = &waveformatex;
             secondary_buffer_description.dwFlags = 0;
 
-            LPDIRECTSOUNDBUFFER secondary_buffer;
             if (SUCCEEDED(direct_sound->CreateSoundBuffer(&secondary_buffer_description, &secondary_buffer, nullptr))) {
                 OutputDebugString("Secondary Buffer Created.\n");
             }
@@ -147,10 +152,6 @@ get_window_dimensions(HWND window) {
 
     return dimensions;
 }
-
-// TODO these are global for now
-global_variable bool32 Running;
-global_variable win32_offscreen_buffer global_backbuffer;
 
 
 internal void
@@ -365,7 +366,21 @@ WinMain(
             int x_offset = 0;
             int y_offset = 0;
 
-            Win32InitDSound(window_handle, 48000, 48000 * sizeof(int16_t) * 2);
+            // NOTE(mike): square wave sound test
+            // TODO
+            int samples_per_second = 48000;
+            int tone_hz = 256;
+            int16_t tone_volume = 3000;
+            // Note(mike): running_sample_index needs to be unsigned because we let it wrap
+            uint32_t running_sample_index = 0;
+            int square_wave_period = samples_per_second / tone_hz;
+            int half_square_wave_period = square_wave_period / 2;
+            int bytes_per_sample = sizeof(int16_t) * 2;
+            int secondary_buffer_size = samples_per_second * bytes_per_sample;
+
+            Win32InitDSound(window_handle, samples_per_second, secondary_buffer_size);
+
+            secondary_buffer->Play(0, 0, DSBPLAY_LOOPING);
 
             Running = true;
             while (Running) {
@@ -418,6 +433,60 @@ WinMain(
                 // XInputSetState(0, &vib);
 
                 RenderWeirdGradient(&global_backbuffer, x_offset, y_offset);
+
+                // NOTE(mike): DirectSound output test
+                DWORD play_cursor;
+                DWORD write_cursor;
+                if (SUCCEEDED(secondary_buffer->GetCurrentPosition(&play_cursor, &write_cursor))) {
+                    // we need to lock our buffer
+                    DWORD byte_to_lock = running_sample_index * bytes_per_sample % secondary_buffer_size;
+                    DWORD bytes_to_write;
+                    if (byte_to_lock > play_cursor) {
+                        bytes_to_write = secondary_buffer_size - byte_to_lock;
+                        bytes_to_write += play_cursor;
+                    } else {
+                        bytes_to_write = play_cursor - byte_to_lock;
+                    }
+
+                    VOID *region_1;
+                    DWORD region_1_size;
+                    VOID *region_2;
+                    DWORD region_2_size;
+
+
+                    if (SUCCEEDED(secondary_buffer->Lock(
+                        byte_to_lock,
+                        bytes_to_write,
+                        &region_1, &region_1_size,
+                        &region_2, &region_2_size,
+                        0
+                    ))) {
+                        int16_t *sample_out = (int16_t *) region_1;
+                        DWORD region_1_sample_count = region_1_size / bytes_per_sample;
+                        DWORD region_2_sample_count = region_2_size / bytes_per_sample;
+                        // region_1_size better be an even multiple of sample size, because we have a left and a right channel
+                        for (DWORD sample_index = 0; sample_index < region_1_sample_count; ++sample_index) {
+                            // Note(mike): we need to know which half way period we are on
+                            int16_t sample_value = ((running_sample_index++ / half_square_wave_period) % 2)
+                                                       ? tone_volume
+                                                       : -tone_volume;
+                            *sample_out++ = sample_value;
+                            *sample_out++ = sample_value;
+                        }
+                        for (DWORD sample_index = 0; sample_index < region_2_sample_count; ++sample_index) {
+                            // Note(mike): we need to know which half way period we are on
+                            int16_t sample_value = ((running_sample_index++ / half_square_wave_period) % 2)
+                                                       ? tone_volume
+                                                       : -tone_volume;
+                            *sample_out++ = sample_value;
+                            *sample_out++ = sample_value;
+                        }
+                        secondary_buffer->Unlock(
+                            region_1, region_1_size,
+                            region_2, region_2_size
+                        );
+                    }
+                }
 
                 HDC device_context = GetDC(window_handle);
                 const win32_window_dimensions dimensions = get_window_dimensions(window_handle);
