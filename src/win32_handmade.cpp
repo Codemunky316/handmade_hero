@@ -3,6 +3,8 @@
 #include <iostream>
 #include <xinput.h>
 #include <dsound.h>
+// TODO(mike): implement sin ourselves
+#include <math.h>
 
 // apparently GDB does not capture windows debug outputs...wtf
 // not something i'd do in PROD
@@ -13,8 +15,14 @@
 #define global_variable static
 #define internal static
 
+#define PI32 3.14159265358979323846f
+
 // in c++ bool needs to be either 0 or 1, so the compiler creates implicit "conversion" from any int > 0 to 1, which is unnecessary
 typedef int32_t bool32;
+
+// Note(mike): typedeffing primitives this way can be a touchy subject
+typedef float real32;
+typedef double real64;
 
 struct win32_offscreen_buffer {
     BITMAPINFO info;
@@ -329,6 +337,60 @@ Win32MainWindowCallback(
     return result;
 }
 
+struct Win32SoundOutput {
+    int samples_per_sec;
+    int tone_hz;
+    int16_t tone_volume;
+    uint32_t running_sample_index;
+    int wave_period;
+    int bytes_per_sample;
+    int secondary_buffer_size;
+};
+
+internal void
+Win32FillSoundBuffer(Win32SoundOutput *sound_output, DWORD byte_to_lock, DWORD bytes_to_write) {
+    VOID *region_1;
+    DWORD region_1_size;
+    VOID *region_2;
+    DWORD region_2_size;
+
+
+    if (SUCCEEDED(secondary_buffer->Lock(
+        byte_to_lock,
+        bytes_to_write,
+        &region_1, &region_1_size,
+        &region_2, &region_2_size,
+        0
+    ))) {
+        int16_t *sample_out = (int16_t *) region_1;
+        DWORD region_1_sample_count = region_1_size / sound_output->bytes_per_sample;
+        // region_1_size better be an even multiple of sample size, because we have a left and a right channel
+        // TODO(mike): collapse these two loops
+        for (DWORD sample_index = 0; sample_index < region_1_sample_count; ++sample_index) {
+            real32 t = 2.0f * PI32 * (real32) sound_output->running_sample_index / (real32) sound_output->wave_period;
+            real32 sine_value = sin(t);
+            int16_t sample_value = (int16_t) (sine_value * sound_output->tone_volume);
+            *sample_out++ = sample_value;
+            *sample_out++ = sample_value;
+            ++sound_output->running_sample_index;
+        }
+        DWORD region_2_sample_count = region_2_size / sound_output->bytes_per_sample;
+        sample_out = (int16_t *) region_2;
+        for (DWORD sample_index = 0; sample_index < region_2_sample_count; ++sample_index) {
+            real32 t = 2.0f * PI32 * (real32) sound_output->running_sample_index / (real32) sound_output->wave_period;
+            real32 sine_value = sin(t);
+            int16_t sample_value = (int16_t) (sine_value * sound_output->tone_volume);
+            *sample_out++ = sample_value;
+            *sample_out++ = sample_value;
+            ++sound_output->running_sample_index;
+        }
+        secondary_buffer->Unlock(
+            region_1, region_1_size,
+            region_2, region_2_size
+        );
+    }
+}
+
 int CALLBACK
 WinMain(
     _In_ HINSTANCE hInstance,
@@ -366,21 +428,20 @@ WinMain(
             int x_offset = 0;
             int y_offset = 0;
 
-            // NOTE(mike): square wave sound test
-            // TODO
-            int samples_per_second = 48000;
-            int tone_hz = 256;
-            int16_t tone_volume = 3000;
+            Win32SoundOutput sound_output = {};
+            sound_output.samples_per_sec = 48000;
+            sound_output.tone_hz = 256;
+            sound_output.tone_volume = 3000;
             // Note(mike): running_sample_index needs to be unsigned because we let it wrap
-            uint32_t running_sample_index = 0;
-            int square_wave_period = samples_per_second / tone_hz;
-            int half_square_wave_period = square_wave_period / 2;
-            int bytes_per_sample = sizeof(int16_t) * 2;
-            int secondary_buffer_size = samples_per_second * bytes_per_sample;
+            sound_output.running_sample_index = 0;
+            sound_output.wave_period = sound_output.samples_per_sec / sound_output.tone_hz;
+            sound_output.bytes_per_sample = sizeof(int16_t) * 2;
+            sound_output.secondary_buffer_size = sound_output.samples_per_sec * sound_output.bytes_per_sample;
 
-            Win32InitDSound(window_handle, samples_per_second, secondary_buffer_size);
-
+            Win32InitDSound(window_handle, sound_output.samples_per_sec, sound_output.secondary_buffer_size);
+            Win32FillSoundBuffer(&sound_output, 0, sound_output.secondary_buffer_size);
             secondary_buffer->Play(0, 0, DSBPLAY_LOOPING);
+
 
             Running = true;
             while (Running) {
@@ -437,55 +498,24 @@ WinMain(
                 // NOTE(mike): DirectSound output test
                 DWORD play_cursor;
                 DWORD write_cursor;
+                // NOTE(mike): we're only filling the buffer once
                 if (SUCCEEDED(secondary_buffer->GetCurrentPosition(&play_cursor, &write_cursor))) {
                     // we need to lock our buffer
-                    DWORD byte_to_lock = running_sample_index * bytes_per_sample % secondary_buffer_size;
+                    DWORD byte_to_lock = (sound_output.running_sample_index * sound_output.bytes_per_sample) %
+                                         sound_output.secondary_buffer_size;
+                    // TODO(mike): wee need a more accurate check than byte_to_lock == play_cursor
                     DWORD bytes_to_write;
-                    if (byte_to_lock > play_cursor) {
-                        bytes_to_write = secondary_buffer_size - byte_to_lock;
+                    // TODO(mike): change this to lower latency offset from the playcursor when we actually want to play sound effects
+                    if (byte_to_lock == play_cursor) {
+                        bytes_to_write = 0;
+                    } else if (byte_to_lock > play_cursor) {
+                        bytes_to_write = sound_output.secondary_buffer_size - byte_to_lock;
                         bytes_to_write += play_cursor;
                     } else {
                         bytes_to_write = play_cursor - byte_to_lock;
                     }
 
-                    VOID *region_1;
-                    DWORD region_1_size;
-                    VOID *region_2;
-                    DWORD region_2_size;
-
-
-                    if (SUCCEEDED(secondary_buffer->Lock(
-                        byte_to_lock,
-                        bytes_to_write,
-                        &region_1, &region_1_size,
-                        &region_2, &region_2_size,
-                        0
-                    ))) {
-                        int16_t *sample_out = (int16_t *) region_1;
-                        DWORD region_1_sample_count = region_1_size / bytes_per_sample;
-                        DWORD region_2_sample_count = region_2_size / bytes_per_sample;
-                        // region_1_size better be an even multiple of sample size, because we have a left and a right channel
-                        for (DWORD sample_index = 0; sample_index < region_1_sample_count; ++sample_index) {
-                            // Note(mike): we need to know which half way period we are on
-                            int16_t sample_value = ((running_sample_index++ / half_square_wave_period) % 2)
-                                                       ? tone_volume
-                                                       : -tone_volume;
-                            *sample_out++ = sample_value;
-                            *sample_out++ = sample_value;
-                        }
-                        for (DWORD sample_index = 0; sample_index < region_2_sample_count; ++sample_index) {
-                            // Note(mike): we need to know which half way period we are on
-                            int16_t sample_value = ((running_sample_index++ / half_square_wave_period) % 2)
-                                                       ? tone_volume
-                                                       : -tone_volume;
-                            *sample_out++ = sample_value;
-                            *sample_out++ = sample_value;
-                        }
-                        secondary_buffer->Unlock(
-                            region_1, region_1_size,
-                            region_2, region_2_size
-                        );
-                    }
+                    Win32FillSoundBuffer(&sound_output, byte_to_lock, bytes_to_write);
                 }
 
                 HDC device_context = GetDC(window_handle);
